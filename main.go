@@ -22,7 +22,14 @@ type Finding struct {
 	Command    string     `json:"command"`
 	Confidence string     `json:"confidence"`
 	Rules      []string   `json:"rules"`
+	Jev        *float64   `json:"jev,omitempty"` // TypeSafe's probability, with --jev
 	Locations  []Location `json:"locations"`
+}
+
+// seenCmd is one distinct command, scanned once however often it recurs.
+type seenCmd struct {
+	hits []Hit
+	locs []Location
 }
 
 type Location struct {
@@ -40,6 +47,10 @@ Usage:
 
 Scans zsh, bash, fish, nushell (txt + sqlite), atuin, PowerShell, ksh, tcsh,
 and psql/mysql/python/node/sqlite/redis/irb/mongosh REPL histories.
+
+With --jev, commands are also judged by Jev, TypeSafe's probability model
+(needs TYPESAFE_API_KEY). Candidate commands are sent to api.typesafe.ai
+exactly as typed, secrets included.
 
 Exits 0 when nothing is found, 1 when secrets are found, 2 on error.
 
@@ -62,6 +73,12 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		format  = fs.String("format", "plain", "format of FILE arguments: "+strings.Join(formats, ", "))
 		noColor = fs.Bool("no-color", false, "disable colour")
 		showVer = fs.Bool("version", false, "print version")
+
+		useJev     = fs.Bool("jev", false, "also judge commands with Jev (TypeSafe); sends them unmasked to api.typesafe.ai")
+		jevThresh  = fs.Float64("jev-threshold", 0.7, "Jev probability at or above which a command counts as a leak")
+		jevLimit   = fs.Int("jev-limit", 200, "most recent keyword-only commands (no rule match) to ask Jev about")
+		jevModel   = fs.String("jev-model", "", "Jev model (default $JEV_MODEL, else jev-latest)")
+		jevWorkers = fs.Int("jev-workers", 20, "concurrent Jev requests")
 	)
 	fs.Usage = func() { fmt.Fprint(stderr, usage); fs.PrintDefaults() }
 	if err := fs.Parse(args); err != nil {
@@ -110,7 +127,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return 0
 	}
 
-	byCmd := map[string]*Finding{}
+	seen := map[string]*seenCmd{}
 	var order []string
 	scanned, failed := 0, false
 	for _, src := range sources {
@@ -128,39 +145,102 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		}
 		scanned += len(entries)
 		for _, e := range entries {
-			hits := Scan(e.Command)
-			if *high {
-				hits = slices.DeleteFunc(hits, func(h Hit) bool { return h.Confidence != High })
-			}
-			if len(hits) == 0 {
-				continue
-			}
-			shown := e.Command
-			if !*reveal {
-				shown = Redact(e.Command, hits)
-			}
-			f, ok := byCmd[e.Command]
+			c, ok := seen[e.Command]
 			if !ok {
-				f = &Finding{Command: shown, Confidence: Medium}
-				for _, h := range hits {
-					if !slices.Contains(f.Rules, h.Rule) {
-						f.Rules = append(f.Rules, h.Rule)
-					}
-					if h.Confidence == High {
-						f.Confidence = High
-					}
+				c = &seenCmd{hits: Scan(e.Command)}
+				if *high {
+					c.hits = slices.DeleteFunc(c.hits, func(h Hit) bool { return h.Confidence != High })
 				}
-				byCmd[e.Command] = f
+				seen[e.Command] = c
 				order = append(order, e.Command)
 			}
-			f.Locations = append(f.Locations, Location{e.Source, e.Path, e.Line})
+			c.locs = append(c.locs, Location{e.Source, e.Path, e.Line})
+		}
+	}
+
+	// Jev judges medium-confidence hits and keyword-only commands. Vendor-format
+	// tokens are certain, so they are not sent. --high-only skips Jev entirely.
+	var scores map[string]float64
+	if *useJev && !*high {
+		client, err := newJevClient(*jevModel)
+		if err != nil {
+			fmt.Fprintln(stderr, "sanity-check:", err)
+			return 2
+		}
+		var ask, keywordOnly []string
+		for _, cmd := range order {
+			hits := seen[cmd].hits
+			switch {
+			case len(hits) == 0:
+				if jevKeyword.MatchString(cmd) {
+					keywordOnly = append(keywordOnly, cmd)
+				}
+			case !slices.ContainsFunc(hits, func(h Hit) bool { return h.Confidence == High }):
+				ask = append(ask, cmd)
+			}
+		}
+		// History is read oldest first, so the tail is the most recent.
+		if len(keywordOnly) > *jevLimit {
+			keywordOnly = keywordOnly[len(keywordOnly)-*jevLimit:]
+		}
+		ask = append(ask, keywordOnly...)
+		if len(ask) > 0 {
+			fmt.Fprintf(stderr, "jev: sending %d commands to TypeSafe (unmasked)\n", len(ask))
+			var progress io.Writer
+			if isTTY(stderr) {
+				progress = stderr
+			}
+			var nFailed int
+			scores, nFailed, err = judgeAll(client, ask, max(*jevWorkers, 1), progress)
+			if nFailed > 0 {
+				fmt.Fprintf(stderr, "jev: %d of %d requests failed, those keep the rule-based verdict. First error: %v\n", nFailed, len(ask), err)
+				if nFailed == len(ask) {
+					failed = true
+				}
+			}
 		}
 	}
 
 	findings := make([]Finding, 0, len(order))
-	for _, k := range order {
-		findings = append(findings, *byCmd[k])
+	for _, cmd := range order {
+		c := seen[cmd]
+		score, judged := scores[cmd]
+		var f Finding
+		switch {
+		case len(c.hits) > 0:
+			f = Finding{Command: cmd, Confidence: Medium}
+			for _, h := range c.hits {
+				if !slices.Contains(f.Rules, h.Rule) {
+					f.Rules = append(f.Rules, h.Rule)
+				}
+				if h.Confidence == High {
+					f.Confidence = High
+				}
+			}
+			// Jev overrules a medium-confidence rule match it disagrees with.
+			if judged && score < *jevThresh {
+				continue
+			}
+			if !*reveal {
+				f.Command = Redact(cmd, c.hits)
+			}
+		case judged && score >= *jevThresh:
+			// Found by Jev alone, so the secret's position is unknown: mask
+			// anything that looks like a value.
+			f = Finding{Command: cmd, Confidence: Medium, Rules: []string{"jev"}}
+			if !*reveal {
+				f.Command = maskValues(cmd)
+			}
+		default:
+			continue
+		}
+		if judged {
+			f.Jev = &score
+		}
+		f.Locations = c.locs
+		findings = append(findings, f)
 	}
+
 	// High confidence first, otherwise in the order they were found.
 	slices.SortStableFunc(findings, func(a, b Finding) int {
 		if a.Confidence == b.Confidence {
@@ -198,9 +278,10 @@ func writeJSON(w io.Writer, v any) int {
 }
 
 func color(w io.Writer, disabled bool) bool {
-	if disabled || os.Getenv("NO_COLOR") != "" {
-		return false
-	}
+	return !disabled && os.Getenv("NO_COLOR") == "" && isTTY(w)
+}
+
+func isTTY(w io.Writer) bool {
 	f, ok := w.(*os.File)
 	if !ok {
 		return false
@@ -225,6 +306,9 @@ func printText(stdout, stderr io.Writer, findings []Finding, nSources, nCmds int
 		where := fmt.Sprintf("%s:%d", loc.Source, loc.Line)
 		if n := len(f.Locations); n > 1 {
 			where += fmt.Sprintf(" (+%d more)", n-1)
+		}
+		if f.Jev != nil {
+			where += paint("2", fmt.Sprintf("  jev %.2f", *f.Jev))
 		}
 		cmd := strings.ReplaceAll(f.Command, "\n", "⏎")
 		fmt.Fprintf(stdout, "%s  %-24s %s\n        %s\n", label, strings.Join(f.Rules, ","), paint("2", where), cmd)

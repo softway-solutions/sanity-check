@@ -82,6 +82,40 @@ References never count as findings. These are all ignored:
 - files and stdin: `@file`, `/path`, `< file`, `--password-stdin`
 - placeholders: `<token>`, `[AuthToken]`, `your_api_key_here`, `xxxxxx`
 
+## Judging with Jev (optional)
+
+`--jev` asks [Jev](https://typesafe.ai) to judge each command as well.
+Jev is TypeSafe's model, and it answers questions with a probability. It
+needs `TYPESAFE_API_KEY`, which you can get at
+https://console.typesafe.ai/keys.
+
+```sh
+TYPESAFE_API_KEY=... sanity-check --jev
+```
+
+> **Commands are sent to `api.typesafe.ai` exactly as typed, secrets
+> included.** Only use `--jev` if you're comfortable with TypeSafe seeing them.
+
+Jev answers one yes/no question for each command: *"Does this shell command
+contain a literal credential value (API key, password, token), rather than a
+$env reference or a `security find-generic-password` lookup?"*
+
+| Command | Sent to Jev? | Result |
+|---|---|---|
+| Matches a vendor token format | no | always reported |
+| Matches a medium-confidence rule | yes | reported only if Jev scores ≥ `--jev-threshold` (default 0.7) |
+| Matches no rule but mentions token, password, secret, key, auth, login and similar | yes, the most recent `--jev-limit` (default 200) | reported as rule `jev` if Jev scores ≥ threshold |
+| Anything else | no | not reported |
+
+If a Jev request fails, that command keeps the rule-based verdict and a
+warning is printed. The command exits with `2` only if every request fails.
+
+Other flags:
+- `--jev-model` picks the model. The default is `$JEV_MODEL`, or
+  `jev-latest`.
+- `--jev-workers` sets how many requests run at once. The default is 20.
+- `JEV_BASE_URL` overrides the API endpoint.
+
 ## Fixing a finding
 
 1. **Rotate the credential.** It has been on disk in plain text.
