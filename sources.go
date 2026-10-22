@@ -252,7 +252,12 @@ func fishUnescape(s string) string {
 
 func readSQL(src Source, query string) ([]Entry, error) {
 	// Read-only, and never create the file if it vanished.
-	u := url.URL{Scheme: "file", Path: src.Path, RawQuery: "mode=ro&_pragma=busy_timeout(3000)"}
+	// Windows paths need forward slashes and a leading slash: file:///C:/...
+	p := filepath.ToSlash(src.Path)
+	if !strings.HasPrefix(p, "/") {
+		p = "/" + p
+	}
+	u := url.URL{Scheme: "file", Path: p, RawQuery: "mode=ro&_pragma=busy_timeout(3000)"}
 	db, err := sql.Open("sqlite", u.String())
 	if err != nil {
 		return nil, err
