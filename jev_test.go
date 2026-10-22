@@ -55,12 +55,12 @@ func runJSON(t *testing.T, in string, args ...string) ([]Finding, int, string) {
 func TestJev(t *testing.T) {
 	gh := fake("ghp_", 36)
 	in := strings.Join([]string{
-		"ls -la",                            // no keyword: never sent
-		"gh auth login --with-token " + gh,  // vendor format: kept, never sent
-		"export DB_PASSWORD=hunter2Xy9",     // medium: Jev confirms
-		"export LOG_SECRET=q8Zr2LmP4vKx9",   // medium: Jev overrules
-		"mytool login q8Zr2LmP4vKx9Wq",      // no rule, keyword: Jev finds it
-		"git log --author=me",               // no rule, keyword "auth": Jev clears it
+		"ls -la",                           // no keyword: never sent
+		"gh auth login --with-token " + gh, // vendor format: kept, never sent
+		"export DB_PASSWORD=hunter2Xy9",    // medium: Jev confirms
+		"export LOG_SECRET=q8Zr2LmP4vKx9",  // medium: Jev overrules
+		"mytool login q8Zr2LmP4vKx9Wq",     // no rule, keyword: Jev finds it
+		"git log --author=me",              // no rule, keyword "auth": Jev clears it
 	}, "\n")
 	asked := stubJev(t, func(s string) float64 {
 		switch {
