@@ -35,14 +35,17 @@ done
 (cd "$dist" && shasum -a 256 *.tar.gz *.zip > checksums.txt)
 
 git tag -a "$version" -m "$version"
-git push origin "$version"
+# Push over HTTPS with gh's credentials, so a personal SSH key mapped to
+# github.com can't push as the wrong account.
+ghgit() { git -c credential.helper= -c credential.helper='!gh auth git-credential' "$@"; }
+ghgit push "https://github.com/$repo.git" "$version"
 gh release create "$version" --repo "$repo" --title "$version" --generate-notes "$dist"/*.tar.gz "$dist"/*.zip "$dist/checksums.txt"
 
 sha() { awk -v f="sanity-check_${version#v}_$1.tar.gz" '$2==f {print $1}' "$dist/checksums.txt"; }
 url=https://github.com/$repo/releases/download/$version/sanity-check_${version#v}
 
 tapdir=$(mktemp -d)
-gh repo clone "$tap" "$tapdir" -- --quiet
+ghgit clone -q "https://github.com/$tap.git" "$tapdir"
 mkdir -p "$tapdir/Formula"
 cat > "$tapdir/Formula/sanity-check.rb" <<EOF
 class SanityCheck < Formula
@@ -87,5 +90,5 @@ end
 EOF
 git -C "$tapdir" add Formula/sanity-check.rb
 git -C "$tapdir" commit -qm "sanity-check $version"
-git -C "$tapdir" push -q
+ghgit -C "$tapdir" push -q
 echo "Released $version. Install: brew install $tap/sanity-check" | sed 's#homebrew-tap#tap#'
